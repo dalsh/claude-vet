@@ -1,0 +1,11 @@
+Review the following command and its fetched script(s) for security risks.
+
+Command the user wants to run:
+<command>
+{{COMMAND}}
+</command>
+
+Fetched script content(s):
+<scripts>
+{{SCRIPTS}}
+</scripts>

@@ -11,12 +11,18 @@ claude-vet() {
     return 1
   fi
 
-  # Resolve prompt file relative to this script
-  local script_dir="${CLAUDE_VET_DIR:-${0:A:h}}"
-  local prompt_file="${script_dir}/prompts/review.txt"
+  if ! command -v jq &>/dev/null; then
+    echo "$_cv jq is required but not found in PATH" >&2
+    return 1
+  fi
 
-  if [[ ! -f "$prompt_file" ]]; then
-    echo "$_cv prompt file not found at ${prompt_file}" >&2
+  # Resolve prompt files relative to this script
+  local script_dir="${CLAUDE_VET_DIR:-${0:A:h}}"
+  local system_prompt_file="${script_dir}/prompts/system.txt"
+  local user_prompt_file="${script_dir}/prompts/user.txt"
+
+  if [[ ! -f "$system_prompt_file" ]] || [[ ! -f "$user_prompt_file" ]]; then
+    echo "$_cv prompt files not found in ${script_dir}/prompts/" >&2
     return 1
   fi
 
@@ -41,47 +47,81 @@ claude-vet() {
     all_scripts+="=== ${url} ===\n${content}\n\n"
   done <<< "$urls"
 
-  # Build prompt from template
-  local prompt
-  prompt="$(cat "$prompt_file")"
-  prompt="${prompt//\{\{COMMAND\}\}/$full_cmd}"
-  prompt="${prompt//\{\{SCRIPTS\}\}/$(printf '%b' "$all_scripts")}"
+  # Build user message from template (untrusted content goes here)
+  local user_msg
+  user_msg="$(cat "$user_prompt_file")"
+  user_msg="${user_msg//\{\{COMMAND\}\}/$full_cmd}"
+  user_msg="${user_msg//\{\{SCRIPTS\}\}/$(printf '%b' "$all_scripts")}"
 
-  # Ask Claude
+  # JSON schema for structured output validation
+  local json_schema='{"type":"object","properties":{"verdict":{"type":"string","enum":["SAFE","CAUTION","UNSAFE"]},"reason":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}}},"required":["verdict","reason","findings"],"additionalProperties":false}'
+
+  # Ask Claude — system prompt (trusted) is separate from user message (untrusted)
   echo "$_cv asking Claude to review..." >&2
   local review
-  review=$(claude -p "$prompt" 2>/dev/null)
+  review=$(printf '%s' "$user_msg" | claude -p \
+    --system-prompt-file "$system_prompt_file" \
+    --json-schema "$json_schema" \
+    --output-format json \
+    2>/dev/null)
 
   if [[ -z "$review" ]]; then
     echo "$_cv no response from Claude — aborting" >&2
     return 1
   fi
 
-  local verdict
-  verdict=$(printf '%s' "$review" | grep -oE '^VERDICT: (SAFE|CAUTION|UNSAFE)' | awk '{print $2}')
+  # Parse structured_output from CLI JSON envelope using jq
+  local verdict reason findings
+  verdict=$(printf '%s' "$review" | jq -r '.structured_output.verdict // empty' 2>/dev/null)
+  reason=$(printf '%s' "$review" | jq -r '.structured_output.reason // empty' 2>/dev/null)
+  findings=$(printf '%s' "$review" | jq -r '.structured_output.findings[]? | "- " + .' 2>/dev/null)
+
+  # Default-deny: treat unparseable responses as UNSAFE
+  if [[ -z "$verdict" ]]; then
+    echo "$_cv could not determine verdict — treating as UNSAFE" >&2
+    verdict="UNSAFE"
+  fi
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━ Claude Review ━━━━━━━━━━━━━━━━━━━━"
-  printf '%s\n' "$review"
+  echo "VERDICT: $verdict"
+  echo "REASON: $reason"
+  if [[ -n "$findings" ]]; then
+    echo "DETAILS:"
+    printf '%s\n' "$findings"
+  fi
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
 
   case "$verdict" in
     SAFE)
-      echo "$_cv SAFE — executing." >&2
-      eval "$full_cmd"
+      if [[ "$CLAUDE_VET_AUTO_EXECUTE" == "1" ]]; then
+        echo "$_cv SAFE — auto-executing (CLAUDE_VET_AUTO_EXECUTE=1)." >&2
+        eval "$full_cmd"
+        return $?
+      else
+        echo "$_cv SAFE — execute? [Y/n]" >&2
+        read -r response </dev/tty
+        if [[ "$response" =~ ^[Nn]$ ]]; then
+          echo "$_cv aborted." >&2
+          return 1
+        fi
+        eval "$full_cmd"
+        return $?
+      fi
       ;;
     CAUTION)
       echo "$_cv CAUTION — proceed anyway? [y/N]" >&2
       read -r response </dev/tty
       if [[ "$response" =~ ^[Yy]$ ]]; then
         eval "$full_cmd"
+        return $?
       else
         echo "$_cv aborted." >&2
         return 1
       fi
       ;;
-    UNSAFE|"")
+    UNSAFE|*)
       echo "$_cv UNSAFE — aborting." >&2
       return 2
       ;;
